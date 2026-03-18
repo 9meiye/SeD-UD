@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # SeD-UD
 
 **An Influence-Driven and Hierarchically-Decoupled Information Bottleneck for Multimodal Intent Recognition**
@@ -146,6 +145,3 @@ If you use this code in your research, please cite:
 ## Contact
 
 For questions and issues, please open an issue on GitHub.
-=======
-# SeD-UD
->>>>>>> bb465d6c79c5384efd31aadac984ce9a893831d5
