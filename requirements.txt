@@ -1,0 +1,30 @@
+# Multimodal Intent Recognition Project Dependencies
+# Generated: 2026-03-08
+# This file contains core libraries required for the project, can be installed with pip install -r requirements.txt
+
+# PyTorch Core Libraries
+torch>=2.0.0,<3.0.0
+torchvision>=0.15.0,<0.20.0
+
+# Machine Learning & Data Processing
+scikit-learn>=1.3.0,<2.0.0
+numpy>=1.24.0,<2.0.0
+pandas>=2.0.0,<3.0.0
+
+# Deep Learning & Pretrained Models
+transformers>=4.35.0,<5.0.0
+
+# Visualization & Plotting
+matplotlib>=3.7.0,<4.0.0
+tensorboard>=2.14.0,<3.0.0
+
+# Image Processing
+pillow>=10.0.0,<11.0.0
+
+# Optional but recommended libraries
+tqdm>=4.66.0,<5.0.0  # Progress bar display
+
+# Notes:
+# 1. If using CUDA, install corresponding versions of torch and torchvision
+# 2. BERT model needs to be downloaded locally or from Hugging Face
+# 3. Ensure all library versions are compatible to avoid conflicts

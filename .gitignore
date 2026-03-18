@@ -1,0 +1,47 @@
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.python-version
+env/
+venv/
+.venv/
+ENV/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+
+# Training outputs
+runs/
+logs/
+*.tfevents
+*.event
+checkpoints/
+
+# Data
+*.csv
+*.pkl
+*.h5
+data/raw/
+!data/*.py
+
+# Backup files
+*_backup.py
+*-backup.py
+main_backup.py
+main-copy.py
+
+# Other files
+*.log
+*.tmp
+*.bak
+*~
