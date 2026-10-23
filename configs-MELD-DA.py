@@ -2,8 +2,8 @@ from argparse import Namespace
 
 args = Namespace(**{
     'dataset': 'MELD-DA',
-    'data_path': '/root/Zhang/Datasets',
-    'text_pretrained_model': '/root/Zhang/Models/bert-base-uncased',
+    'data_path': '/data/Datasets',
+    'text_pretrained_model': 'bert-base-uncased',
 
     'text_feat_dim': 768,
     'video_feat_dim': 1024,
@@ -13,7 +13,7 @@ args = Namespace(**{
     'video_seq_len': 250,
     'audio_seq_len': 520,
     'max_cons_seq_length': 41,
-    
+
     'num_labels': 12,
     'num_train_examples': 0,
     'train_batch_size': 512,
@@ -23,5 +23,20 @@ args = Namespace(**{
     'hidden_dropout_prob': 0.3,
 
     'seed': 42,
+    'lr': 5e-5,
+    'weight_decay': 0.2,
+    'pretrain_epochs': 10,
+    'use_cross_attention': True,
+    'fusion_heads': 8,
+    'select_metric': 'accuracy',
+    'idab_b2_init': 0.02,
+    'idab_min_dim': 64,
+    'idab_max_dim': 768,
+    'classifier_hidden': 0,
+    'use_pooler': True,
+    'device': '',
+    'save_dir': 'saved_models/MELD-DA',
+    'test_only': False,
+
     'num_workers': 8
 })

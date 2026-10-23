@@ -1,893 +1,693 @@
-import time
+import importlib
 import math
+import os
+import random
+from itertools import islice
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from data.base import DataManager
-import importlib
-import sys
-from data.BERTencoder import TextEncoder
-from sklearn.metrics import classification_report, accuracy_score, f1_score, precision_score, recall_score
-import numpy as np
-from data.__init__ import benchmarks
-from losses.total_loss import compute_loss
 import torch.nn.functional as F
-import random
-import os
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from torch.utils.data import DataLoader
+
+from data.__init__ import benchmarks
+from data.BERTencoder import TextEncoder
+from data.base import DataManager
+from losses.total_loss import compute_loss
+from utils.Function import EarlyStopping
+
 
 def load_config(dataset_name="MIntRec"):
-    config_module_name = f"configs-{dataset_name}"
-    config_module = importlib.import_module(config_module_name)
+    config_module = importlib.import_module(f"configs-{dataset_name}")
     return config_module.args
 
-args = load_config()
 
-def set_random_seed(seed=42):
-    print(f"Setting random seed: {seed}")
-    
-    random.seed(seed)
-    
-    np.random.seed(seed)
-    
-    torch.manual_seed(seed)
-    
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)  
-        
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    print(f"Random seed set: {seed}")
+args = load_config(os.environ.get("SEDUD_DATASET", "MIntRec"))
+device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+DIM = 768
+DENOISED_KEY = "denoised_preds"
 
-try:
-    from utils.Function import EarlyStopping
-except ImportError:
-    class EarlyStopping:
-        def __init__(self, patience=3, delta=0.001):
-            self.patience = patience
-            self.delta = delta
-            self.counter = 0
-            self.best_score = None
-            self.early_stop = False
-        def __call__(self, val_metric):
-            if self.best_score is None:
-                self.best_score = val_metric
-            elif val_metric < self.best_score + self.delta:
-                self.counter += 1
-                print(f'EarlyStopping counter: {self.counter}/{self.patience}')
-                if self.counter >= self.patience:
-                    self.early_stop = True
-            else:
-                self.best_score = val_metric
-                self.counter = 0
 
-try:
-    from utils.alignment import AlignSubNet
-except ImportError:
-    class AlignSubNet:
-        def __init__(self, mode=None, text_feat_dim=None, video_feat_dim=None, audio_feat_dim=None, dst_len=None):
-            pass
-        def forward(self, *args, **kwargs):
-            
-            return None
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def to_device(batch):
+    return {
+        "text_input_ids": batch["input_ids"].to(device),
+        "text_attention_mask": batch["attention_mask"].to(device),
+        "video_feats": batch["video_feats"].to(device),
+        "audio_feats": batch["audio_feats"].to(device),
+    }
+
+
+def make_loader(dataset, batch_size, shuffle=False):
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=collate_fn,
+    )
+
+
+def make_bottleneck(config):
+    return DenoisingBottleneck(
+        DIM,
+        d_min=config.idab_min_dim,
+        d_max=config.idab_max_dim,
+        b2_init=config.idab_b2_init,
+    )
+
+class RedundancyDegree(nn.Module):
+    def __init__(self, dim=768):
+        super().__init__()
+        self.W_r = nn.Linear(2 * dim, 1)
+
+    def forward(self, primary, auxiliary_1, auxiliary_2):
+        dim = primary.shape[-1]
+        attention_1 = torch.softmax(
+            primary @ auxiliary_1.transpose(-2, -1) / math.sqrt(dim), dim=-1
+        )
+        value_1 = attention_1 @ auxiliary_1
+        attention_2 = torch.softmax(
+            primary @ auxiliary_2.transpose(-2, -1) / math.sqrt(dim), dim=-1
+        )
+        value_2 = attention_2 @ auxiliary_2
+        return torch.sigmoid(
+            self.W_r(torch.cat([value_1, value_2], dim=-1))
+        ).squeeze(-1)
+
+
+class NoiseIntensity(nn.Module):
+    def __init__(self, dim=768):
+        super().__init__()
+        self.W_p = nn.Linear(dim, dim)
+
+    def forward(self, features):
+        importance = torch.sigmoid(self.W_p(features))
+        return torch.sigmoid(
+            (importance * features.abs()).sum(dim=-1) / features.shape[-1]
+        )
+
 
 class DenoisingBottleneck(nn.Module):
-    def __init__(self, input_dim, min_bottleneck=64, max_bottleneck=768, tau=1.0, eps=1e-6):
+    def __init__(
+        self,
+        dim=768,
+        d_min=64,
+        d_max=768,
+        tau=1.0,
+        eps=1e-6,
+        mask_temp=0.5,
+        b2_init=-0.55,
+    ):
         super().__init__()
-        self.min_bottleneck = min_bottleneck
-        self.max_bottleneck = max_bottleneck
-        self.tau = tau
-        self.eps = eps
-        
-        self.W_p = nn.Linear(input_dim, input_dim)
-        self.b_p = nn.Parameter(torch.zeros(input_dim))
-        
-        self.W_r = nn.Linear(input_dim * 2, 1)
-        self.b_r = nn.Parameter(torch.zeros(1))
-        
-        self.attention = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, max_bottleneck),
-            nn.Softmax(dim=-1)
-        )
-        
-        self.encoder = nn.Linear(input_dim, max_bottleneck)
-        self.decoder = nn.Linear(max_bottleneck, input_dim)
-        self.actual_bottleneck_dim = max_bottleneck
-        
+        self.dim = int(dim)
+        self.d_min = int(d_min)
+        self.d_max = int(d_max if d_max is not None else dim)
+        self.tau = float(tau)
+        self.eps = float(eps)
+        self.mask_temp = float(mask_temp)
+
+        self.encoder = nn.Linear(self.dim, self.d_max)
+        self.decoder = nn.Linear(self.d_max, self.dim)
         self.w1 = nn.Parameter(torch.tensor(1.0))
         self.w2 = nn.Parameter(torch.tensor(1.0))
         self.b1 = nn.Parameter(torch.tensor(0.0))
-        self.b2 = nn.Parameter(torch.tensor(0.0))
-        
-        self.act = nn.GELU()
-        self.dropout = nn.Dropout(0.1)
-        
-        self.external_noise_level = None
-        self.external_correlation_score = None
-        
-        self.bottleneck_dims = []
-        
-        self.train_attention_times = []   
-        self.train_sorting_times = []     
-        self.eval_attention_times = []    
-        self.eval_sorting_times = []      
-        
-        self._current_loss = None
-        self._importance_weights = None
-        self._parameter_ranking = None
-    
-    def state_dict(self, destination=None, prefix='', keep_vars=False):
-        state_dict = super().state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
-        
-        if self._importance_weights is not None:
-            state_dict[prefix + '_importance_weights'] = self._importance_weights
-        if self._parameter_ranking is not None:
-            state_dict[prefix + '_parameter_ranking'] = self._parameter_ranking
-        
-        return state_dict
-    
-    def load_state_dict(self, state_dict, strict=True):
-        importance_key = prefix = ''
-        for key in state_dict.keys():
-            if key.endswith('_importance_weights'):
-                importance_key = key
-                break
-        
-        ranking_key = ''
-        for key in state_dict.keys():
-            if key.endswith('_parameter_ranking'):
-                ranking_key = key
-                break
-        
-        importance_weights = None
-        parameter_ranking = None
-        
-        if importance_key:
-            importance_weights = state_dict.pop(importance_key)
-        
-        if ranking_key:
-            parameter_ranking = state_dict.pop(ranking_key)
-        
-        result = super().load_state_dict(state_dict, strict=strict)
-        
-        if importance_weights is not None:
-            self._importance_weights = importance_weights
-        
-        if parameter_ranking is not None:
-            self._parameter_ranking = parameter_ranking
-        
-        return result
+        self.b2 = nn.Parameter(torch.tensor(float(b2_init)))
+
+        self.register_buffer("_parameter_ranking", torch.arange(self.d_max))
+        self.register_buffer("rank_ready", torch.zeros(1))
+
+        self.selection_enabled = False
+
     def tempered_normalization(self, alpha):
-        tanh_alpha = torch.tanh(alpha / self.tau)
-        
-        norm = torch.norm(tanh_alpha, p=2)
-        
-        alpha_bar = tanh_alpha / (norm + self.eps)
-        return alpha_bar
+        alpha = alpha.reshape(-1).float()
+        values = torch.tanh(alpha / self.tau)
+        norm = torch.linalg.vector_norm(values, ord=2)
+        return values / (norm + self.eps)
+
     def compute_beta(self, alpha_bar):
-        beta = self.w2 * F.silu(self.w1 * alpha_bar + self.b1) + self.b2
-        return beta
+        return self.w2 * F.silu(self.w1 * alpha_bar + self.b1) + self.b2
+
     def compute_compression_dimension(self, beta):
-        D = self.max_bottleneck
-        
-        D_pow = D ** (1 - beta)
-        
-        D_rounded = torch.round(D_pow)
-        
-        Dc = torch.clamp(D_rounded, self.min_bottleneck, self.max_bottleneck)
-        return Dc.int()
-    def compute_parameter_importance(self, loss):
-        self._current_loss = loss
-        
-        loss.backward(retain_graph=True)
-        
-        if self.encoder.weight.grad is not None:
-            
-            enc_dim_importance = (self.encoder.weight.norm(p=2, dim=1)**2 * 
-                                self.encoder.weight.grad.norm(p=2, dim=1)**2)
-        else:
-            enc_dim_importance = torch.zeros(self.max_bottleneck, device=self.encoder.weight.device)
-        
-        if self.decoder.weight.grad is not None:
-            
-            dec_dim_importance = (self.decoder.weight.norm(p=2, dim=0)**2 *
-                                self.decoder.weight.grad.norm(p=2, dim=0)**2)
-        else:
-            dec_dim_importance = torch.zeros(self.max_bottleneck, device=self.decoder.weight.device)
-        
-        combined_importance = enc_dim_importance + dec_dim_importance
-        
-        if combined_importance.sum() > 0:
-            normalized_importance = combined_importance / combined_importance.sum()
-        else:
-            normalized_importance = torch.ones(self.max_bottleneck, device=combined_importance.device) / self.max_bottleneck
-        
-        self._importance_weights = normalized_importance.detach()
-        
-        self.zero_grad()
-        return normalized_importance
-    
-    def compute_noise_intensity(self, x):
-        I = torch.sigmoid(self.W_p(x) + self.b_p)
-        
-        D = x.shape[-1]
-        weighted_abs = I * torch.abs(x)
-        gamma = torch.sigmoid(torch.sum(weighted_abs, dim=-1) / D)
-        
-        return gamma, I
-    
-    def _single_modal_denoise(self, x, original_dim):
-        if x.dim() == 3:
-            x = x.mean(dim=1)  
-        
-        if x.shape[-1] != original_dim:
-            x = F.pad(x, (0, original_dim - x.shape[-1]))
-        
-        if torch.isnan(x).any():
-            print(f"Warning: Single modal denoising input contains NaN values")
-            x = torch.nan_to_num(x, nan=0.0)
-        
-        gamma, I = self.compute_noise_intensity(x)
-        
-        if torch.isnan(gamma).any():
-            print(f"Warning: Noise intensity contains NaN values, using default values")
-            gamma = torch.ones_like(gamma) * 0.5
-        
-        alpha_bar = self.tempered_normalization(gamma.mean())
-        
+        return torch.clamp(self.dim ** (1.0 - beta), self.d_min, self.d_max)
+
+    def forward(self, features, alpha):
+        if features.dim() == 3:
+            features = features.mean(dim=1)
+
+        batch_size = features.shape[0]
+        if alpha is None:
+            alpha = torch.zeros(
+                batch_size, device=features.device, dtype=features.dtype
+            )
+        alpha = alpha.reshape(-1)
+        if alpha.numel() == 1:
+            alpha = alpha.expand(batch_size)
+        if alpha.numel() != batch_size:
+            alpha = alpha[:batch_size]
+
+        alpha_bar = self.tempered_normalization(alpha)
         beta = self.compute_beta(alpha_bar)
-        
-        bottleneck_dim = self.compute_compression_dimension(beta)
-        
-        if bottleneck_dim.dim() > 0:
-            bottleneck_dim = bottleneck_dim.item()
-        
-        bottleneck_dim = min(bottleneck_dim, self.max_bottleneck)
-        
-        if bottleneck_dim < self.max_bottleneck:
-            
-            if self._importance_weights is not None:
-                
-                importance_weights = self._importance_weights
-            else:
-                
-                
-                importance_weights = torch.ones(self.max_bottleneck, device=x.device) / self.max_bottleneck
-            
-            _, topk_indices = torch.topk(importance_weights, k=bottleneck_dim)
-            
-            enc_weight = self.encoder.weight[topk_indices]
-            enc_bias = self.encoder.bias[topk_indices]
-            dec_weight = self.decoder.weight[:, topk_indices]
-            dec_bias = self.decoder.bias
+        soft_dim = self.compute_compression_dimension(beta)
+        hard_dim = soft_dim.round().clamp(self.d_min, self.d_max)
+
+        if self.selection_enabled:
+            straight_through_dim = soft_dim + (hard_dim - soft_dim).detach()
+            positions = torch.arange(
+                self.d_max, device=features.device, dtype=features.dtype
+            )
+            soft_mask = torch.sigmoid(
+                (straight_through_dim.unsqueeze(1) - positions.unsqueeze(0))
+                / self.mask_temp
+            )
+            hard_mask = (
+                positions.unsqueeze(0) < hard_dim.unsqueeze(1)
+            ).to(features.dtype)
+            mask = hard_mask + (soft_mask - soft_mask.detach())
         else:
-            
-            enc_weight = self.encoder.weight
-            enc_bias = self.encoder.bias
-            dec_weight = self.decoder.weight
-            dec_bias = self.decoder.bias
-        
-        encoded = F.linear(x, weight=enc_weight, bias=enc_bias)
-        encoded = self.dropout(self.act(encoded))
-        decoded = F.linear(encoded, weight=dec_weight, bias=dec_bias)
-        decoded = self.act(decoded)
-        if self.training:  
-            decoded = self.dropout(decoded)
-        
-        compression_ratio = 1 - (bottleneck_dim / self.max_bottleneck)
-        if self.modal_type == 'Text' and self.text_ratios is not None:
-            self.text_ratios.append(compression_ratio)
-        elif self.modal_type == 'Video' and self.video_ratios is not None:
-            self.video_ratios.append(compression_ratio)
-        elif self.modal_type == 'Audio' and self.audio_ratios is not None:
-            self.audio_ratios.append(compression_ratio)
-        
-        self._last_noise_level = gamma.mean().item()
-        return decoded
-    
-    def compute_redundancy_degree(self, F_pri, F_aux1, F_aux2):
-        D = F_pri.shape[-1]
-        
-        attn_weights1 = torch.matmul(F_pri, F_aux1.transpose(-2, -1)) / (D ** 0.5)
-        attn_probs1 = F.softmax(attn_weights1, dim=-1)
-        V1 = torch.matmul(attn_probs1, F_aux1)
-        
-        attn_weights2 = torch.matmul(F_pri, F_aux2.transpose(-2, -1)) / (D ** 0.5)
-        attn_probs2 = F.softmax(attn_weights2, dim=-1)
-        V2 = torch.matmul(attn_probs2, F_aux2)
-        
-        V_concat = torch.cat([V1, V2], dim=-1)
-        r = torch.sigmoid(self.W_r(V_concat) + self.b_r)
-        
-        return r.squeeze(-1), V1, V2
-    
-    def _multi_modal_redundancy_removal(self, x, y, z, modal_type):
-        if torch.isnan(x).any() or torch.isnan(y).any() or torch.isnan(z).any():
-            print(f"Warning: Redundancy removal input contains NaN values")
-            x = torch.nan_to_num(x, nan=0.0)
-            y = torch.nan_to_num(y, nan=0.0)
-            z = torch.nan_to_num(z, nan=0.0)
-        
-        r, V1, V2 = self.compute_redundancy_degree(x, y, z)
-        
-        if torch.isnan(r).any():
-            print(f"Warning: Redundancy degree contains NaN values, using default values")
-            r = torch.ones_like(r) * 0.5
-        
-        alpha_bar = self.tempered_normalization(r.mean())
-        
-        beta = self.compute_beta(alpha_bar)
-        
-        bottleneck_dim = self.compute_compression_dimension(beta)
-        
-        if bottleneck_dim.dim() > 0:
-            bottleneck_dim = bottleneck_dim.item()
-        
-        if self.training:
-            self.bottleneck_dims.append(bottleneck_dim)
-        
-        if bottleneck_dim < self.max_bottleneck:
-            
-            if self._importance_weights is not None:
-                
-                importance_weights = self._importance_weights
-            else:
-                
-                
-                importance_weights = torch.ones(self.max_bottleneck, device=x.device) / self.max_bottleneck
-            
-            _, topk_indices = torch.topk(importance_weights, k=bottleneck_dim)
-            
-            enc_weight = self.encoder.weight[topk_indices]
-            enc_bias = self.encoder.bias[topk_indices]
-            dec_weight = self.decoder.weight[:, topk_indices]
-            dec_bias = self.decoder.bias
-        else:
-            
-            enc_weight = self.encoder.weight
-            enc_bias = self.encoder.bias
-            dec_weight = self.decoder.weight
-            dec_bias = self.decoder.bias
-        
-        encoded = F.linear(x, weight=enc_weight, bias=enc_bias)
-        encoded = self.dropout(self.act(encoded))
-        
-        decoded = F.linear(encoded, weight=dec_weight, bias=dec_bias)
-        decoded = self.act(decoded)
-        if self.training:  
-            decoded = self.dropout(decoded)
-        
-        compression_ratio = 1 - (bottleneck_dim / self.max_bottleneck)
-        if self.modal_type == 'Text' and self.text_ratios is not None:
-            self.text_ratios.append(compression_ratio)
-        elif self.modal_type == 'Video' and self.video_ratios is not None:
-            self.video_ratios.append(compression_ratio)
-        elif self.modal_type == 'Audio' and self.audio_ratios is not None:
-            self.audio_ratios.append(compression_ratio)
-        
-        self._last_correlation_scores = r.mean().item()
-        return decoded
-    def forward(self, x, y, z, modal_type):
-        self.modal_type = modal_type  
-        
-        self.text_ratios = [] if modal_type == 'Text' else None
-        self.video_ratios = [] if modal_type == 'Video' else None 
-        self.audio_ratios = [] if modal_type == 'Audio' else None
-        
-        original_dim = x.shape[-1]
-        if y is None and z is None:
-            
-            decoded = self._single_modal_denoise(x, original_dim)
-        else:
-            
-            decoded = self._multi_modal_redundancy_removal(x, y, z, modal_type)
-        return decoded
-class MultiModalClassifier(nn.Module):
-    def __init__(self, num_classes):
-        super().__init__()
-        
-        self.MAG = MAG(args)
-        self.text_compressor = DenoisingBottleneck(input_dim=768)
-        self.video_compressor = DenoisingBottleneck(input_dim=768)
-        self.audio_compressor = DenoisingBottleneck(input_dim=768)
-        self.text_compressor.modal_type = 'Text'
-        self.video_compressor.modal_type = 'Video' 
-        self.audio_compressor.modal_type = 'Audio'
-        self.denoising_bottleneck = DenoisingBottleneck(input_dim=768)
-        self.fusion_norm = nn.LayerNorm(768)
-        self.text_fusion_norm = nn.LayerNorm(768)
-        self.text_encoder = TextEncoder(pretrained_model=args.text_pretrained_model)
-        
-        self.align_net = AlignSubNet(
-            mode='ctc',
-            text_feat_dim=768,
-            video_feat_dim=768,
-            audio_feat_dim=768,
-            dst_len=512  
+            hard_dim = torch.full(
+                (batch_size,), float(self.d_max), device=features.device
+            )
+            mask = torch.ones(
+                batch_size,
+                self.d_max,
+                device=features.device,
+                dtype=features.dtype,
+            )
+
+        permutation = self._parameter_ranking
+        encoder_weight = self.encoder.weight[permutation]
+        encoder_bias = self.encoder.bias[permutation]
+        encoded = F.linear(features, encoder_weight, encoder_bias) * mask
+        encoded = F.relu(encoded)
+
+        decoder_weight = self.decoder.weight[:, permutation]
+        decoded = F.relu(
+            F.linear(encoded, decoder_weight, self.decoder.bias)
         )
-        
-        self.video_adapter = nn.Linear(args.video_feat_dim, 768)
+
+        return decoded
+
+class ModalityModulationFusion(nn.Module):
+    def __init__(self, dim=768, heads=8, dropout=0.1, use_attention=True):
+        super().__init__()
+        self.use_attention = bool(use_attention)
+        self.gate_v = nn.Linear(2 * dim, 1)
+        self.gate_a = nn.Linear(2 * dim, 1)
+        self.proj_v = nn.Linear(dim, dim)
+        self.proj_a = nn.Linear(dim, dim)
+        self.b_nt = nn.Parameter(torch.zeros(dim))
+
+        self.mha = nn.MultiheadAttention(
+            dim, heads, dropout=dropout, batch_first=True
+        )
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, 4 * dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * dim, dim),
+        )
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, text, video, audio):
+        gate_v = torch.sigmoid(
+            self.gate_v(torch.cat([text, video], dim=-1))
+        )
+        gate_a = torch.sigmoid(
+            self.gate_a(torch.cat([text, audio], dim=-1))
+        )
+        gated_video = gate_v * self.proj_v(video)
+        gated_audio = gate_a * self.proj_a(audio)
+        non_text = gated_video + gated_audio + self.b_nt
+
+        if not self.use_attention:
+            return self.norm1(text + non_text)
+
+        query = text.unsqueeze(1)
+        key_value = non_text.unsqueeze(1)
+        attention, _ = self.mha(
+            query, key_value, key_value, need_weights=False
+        )
+        hidden = self.norm1(
+            text + self.drop(attention.squeeze(1))
+        )
+        return self.norm2(hidden + self.drop(self.ffn(hidden)))
+
+
+class MultiModalClassifier(nn.Module):
+    def __init__(self, args, num_classes):
+        super().__init__()
+        dim = DIM
+
+        self.text_encoder = TextEncoder(
+            pretrained_model=args.text_pretrained_model
+        )
+        self.video_adapter = nn.Linear(int(args.video_feat_dim), dim)
+        self.audio_adapter = nn.Linear(int(args.audio_feat_dim), dim)
+        dropout = float(args.hidden_dropout_prob)
         self.video_encoder = nn.Sequential(
-            nn.Linear(768, 512),
+            nn.Linear(dim, 512),
             nn.ReLU(),
             nn.LayerNorm(512),
-            nn.Dropout(0.1),
-            nn.Linear(512, 768))
-        
-        self.audio_adapter = nn.Linear(args.audio_feat_dim, 768)
+            nn.Dropout(dropout),
+            nn.Linear(512, dim),
+        )
         self.audio_encoder = nn.Sequential(
-            nn.Linear(768, 512),
+            nn.Linear(dim, 512),
             nn.ReLU(),
             nn.LayerNorm(512),
-            nn.Dropout(0.1),
-            nn.Linear(512, 768))
-        self.classifier = nn.Sequential(
-            nn.Linear(768, 1024),
-            nn.GELU(),
-            nn.LayerNorm(1024),
-            nn.Dropout(0.1),
-            nn.Linear(1024, num_classes))
-        self.denoised_classifier = nn.Sequential(
-            nn.Linear(768, 1024),
-            nn.GELU(),
-            nn.LayerNorm(1024),
-            nn.Dropout(0.1),
-            nn.Linear(1024, num_classes))
-        self.text_classifier = nn.Sequential(
-            nn.Linear(768, 1024),
-            nn.GELU(),
-            nn.LayerNorm(1024),
-            nn.Dropout(0.1),
-            nn.Linear(1024, num_classes))
-        
-        self.concat_projection = nn.Linear(768*3, 768)
-    def fused(self, x, y, z):
-        return self.MAG(x, y, z)
-    def forward(self, text_input_ids, text_attention_mask, video_feats, audio_feats, noise_level=0.0):
-        
-        output_dict = {
-            'fused_feats': None,
-            'denoised_feats': None,
-            'text_feats': None,
-            'fused_preds': None,
-            'denoised_preds': None,
-            'text_preds': None,
-            'video_feats': None,
-            'audio_feats': None,
-            'denoised_text_feats': None,
-            'denoised_video_feats': None,
-            'denoised_audio_feats': None,
-            'text_ratios': [],
-            'video_ratios': [],
-            'audio_ratios': []
+            nn.Dropout(dropout),
+            nn.Linear(512, dim),
+        )
+
+        self.text_norm = nn.LayerNorm(dim)
+        self.video_norm = nn.LayerNorm(dim)
+        self.audio_norm = nn.LayerNorm(dim)
+        self.rdc_text = RedundancyDegree(dim)
+        self.rdc_video = RedundancyDegree(dim)
+        self.rdc_audio = RedundancyDegree(dim)
+
+        self.text_compressor = make_bottleneck(args)
+        self.video_compressor = make_bottleneck(args)
+        self.audio_compressor = make_bottleneck(args)
+        self.denoising_bottleneck = make_bottleneck(args)
+
+        self.nic = NoiseIntensity(dim)
+        self.fusion = ModalityModulationFusion(
+            dim,
+            heads=args.fusion_heads,
+            dropout=dropout,
+            use_attention=args.use_cross_attention,
+        )
+        self.fusion_norm = nn.LayerNorm(dim)
+
+        if args.classifier_hidden > 0:
+            self.classifier = nn.Sequential(
+                nn.Linear(dim, args.classifier_hidden),
+                nn.GELU(),
+                nn.LayerNorm(args.classifier_hidden),
+                nn.Dropout(dropout),
+                nn.Linear(args.classifier_hidden, num_classes),
+            )
+        else:
+            self.classifier = nn.Sequential(
+                nn.Dropout(dropout), nn.Linear(dim, num_classes)
+            )
+        self.use_pooler = bool(args.use_pooler)
+
+    def bottlenecks(self):
+        return {
+            "text": self.text_compressor,
+            "video": self.video_compressor,
+            "audio": self.audio_compressor,
+            "fused": self.denoising_bottleneck,
         }
-        
-        
-        text_embedding = self.text_encoder.get_embeddings(text_input_ids.long())
-        
-        video = self.video_adapter(video_feats.float())
-        video = self.video_encoder(video).squeeze(2)
-        
-        audio = self.audio_adapter(audio_feats.float())
-        audio = self.audio_encoder(audio)
-        
+
+    def set_selection(self, enabled):
+        for bottleneck in self.bottlenecks().values():
+            bottleneck.selection_enabled = bool(enabled)
+
+    def enable_selection_if_ready(self):
+        ready = all(
+            float(bottleneck.rank_ready.item()) > 0
+            for bottleneck in self.bottlenecks().values()
+        )
+        self.set_selection(ready)
+        return ready
+
+    def _encode_sequence(self, features, adapter, encoder, chunk=32):
+        batch_size, time_steps, feature_dim = features.shape
+        outputs = []
+        for start in range(0, batch_size, chunk):
+            part = features[start : start + chunk].reshape(-1, feature_dim)
+            encoded = encoder(adapter(part))
+            outputs.append(encoded.reshape(-1, time_steps, DIM).mean(dim=1))
+        return torch.cat(outputs, dim=0)
+
+    def forward(
+        self,
+        text_input_ids,
+        text_attention_mask,
+        video_feats,
+        audio_feats,
+        noise_level=0.0,
+    ):
         text = self.text_encoder(
             input_ids=text_input_ids.long(),
             attention_mask=text_attention_mask.long(),
-            inputs_embeds=None
         )
-        
         if isinstance(text, tuple):
-            text = text[0]  
+            text = text[0]
+        if self.use_pooler:
+            text = self.text_encoder.bert.pooler(text.unsqueeze(1))
         if noise_level > 0:
-            
-            std_dev = torch.sqrt(torch.tensor(noise_level, device=text.device))
-            text = text + torch.randn_like(text) * std_dev
-        
-        video = video.mean(dim=1)
-        audio = audio.mean(dim=1)
-        
-        output_dict.update({
-            'text_feats': self.text_fusion_norm(text),
-            'video_feats': video,
-            'audio_feats': audio,
-            'text_preds': self.text_classifier(text)
-        })
-        
-        deredundant_text = self.text_compressor(text, video, audio, 'Text')
-        deredundant_video = self.video_compressor(video, text, audio, 'Video')
-        deredundant_audio = self.audio_compressor(audio, text, video, 'Audio')
-        fused = self.fused(deredundant_text, deredundant_video, deredundant_audio)
-        output_dict.update({
-            'denoised_text_feats': deredundant_text,
-            'denoised_video_feats': deredundant_video,
-            'denoised_audio_feats': deredundant_audio,
-            'text_ratios': self.text_compressor.text_ratios,
-            'video_ratios': self.video_compressor.video_ratios,
-            'audio_ratios': self.audio_compressor.audio_ratios
-        })
-        
-        if hasattr(self.text_compressor, '_last_correlation_scores'):
-            output_dict['correlation_scores'] = self.text_compressor._last_correlation_scores
-        
-        fused = self.fusion_norm(fused)
-        output_dict.update({
-            'fused_feats': fused,
-            'fused_preds': self.classifier(fused)
-        })
-        
-        denoised_feats = self.denoising_bottleneck(fused, None, None, 'Fused')
-        output_dict['denoised_feats'] = denoised_feats
-        output_dict['denoised_preds'] = self.denoised_classifier(denoised_feats)
-        
-        if hasattr(self.denoising_bottleneck, '_last_noise_level'):
-            output_dict['noise_level'] = self.denoising_bottleneck._last_noise_level
-        
-        if hasattr(self.text_compressor, 'text_ratios'):
-            self.text_compressor.text_ratios.clear()
-        if hasattr(self.video_compressor, 'video_ratios'):
-            self.video_compressor.video_ratios.clear()
-        if hasattr(self.audio_compressor, 'audio_ratios'):
-            self.audio_compressor.audio_ratios.clear()
-        return output_dict
-class MAG(nn.Module):
-    def __init__(self, args):
-        super(MAG, self).__init__()
-        self.args = args
-        
-        text_feat_dim, audio_feat_dim, video_feat_dim = 768, 768, 768
-        self.W_hv = nn.Linear(video_feat_dim + text_feat_dim, text_feat_dim)
-        self.W_ha = nn.Linear(audio_feat_dim + text_feat_dim, text_feat_dim)
-        self.W_v = nn.Linear(video_feat_dim, text_feat_dim)
-        self.W_a = nn.Linear(audio_feat_dim, text_feat_dim)
-        
-        self.beta_shift = 0.006
-        
-        self.residual = nn.Linear(768, 768)
-        self.LayerNorm = nn.LayerNorm(768) 
-        self.dropout = nn.Dropout(args.hidden_dropout_prob) 
-        
-        self.align_net = AlignSubNet(
-            mode='ctc',
-            text_feat_dim=768,
-            video_feat_dim=768,
-            audio_feat_dim=768,
-            dst_len=args.max_cons_seq_length
+            text = text + torch.randn_like(text) * math.sqrt(noise_level)
+
+        video = self._encode_sequence(
+            video_feats.float(), self.video_adapter, self.video_encoder
         )
-    def forward(self, text_embedding, visual, acoustic):
-        eps = 1e-6
-        
-        weight_v = F.relu(self.W_hv(torch.cat((visual, text_embedding), dim=-1)))
-        weight_a = F.relu(self.W_ha(torch.cat((acoustic, text_embedding), dim=-1)))
-        
-        h_m = weight_v * self.W_v(visual) + weight_a * self.W_a(acoustic)
-        
-        em_norm = text_embedding.norm(2, dim=-1)
-        hm_norm = h_m.norm(2, dim=-1)
-        if text_embedding.size(0)<128:
-            hm_norm = hm_norm[:text_embedding.size(0)]
-        
-        hm_norm_ones = torch.ones(hm_norm.shape, requires_grad=True).to(text_embedding.device)
-        hm_norm = torch.where(hm_norm == 0, hm_norm_ones, hm_norm)
-        
-        thresh_hold = (em_norm / (hm_norm + eps)) * self.beta_shift
-        ones = torch.ones(thresh_hold.shape, requires_grad=True).to(text_embedding.device)
-        
-        alpha = torch.min(thresh_hold, ones)
-        alpha = alpha.unsqueeze(dim=-1)
-        acoustic_vis_embedding = alpha * h_m
-        
-        embedding_output = self.dropout(
-            self.LayerNorm(acoustic_vis_embedding + self.residual(text_embedding))
+        audio = self._encode_sequence(
+            audio_feats.float(), self.audio_adapter, self.audio_encoder
         )
-        return embedding_output
+        text = self.text_norm(text)
+        video = self.video_norm(video)
+        audio = self.audio_norm(audio)
+
+        redundancy_text = self.rdc_text(text, video, audio)
+        redundancy_video = self.rdc_video(video, text, audio)
+        redundancy_audio = self.rdc_audio(audio, text, video)
+
+        denoised_text = self.text_compressor(text, redundancy_text)
+        denoised_video = self.video_compressor(video, redundancy_video)
+        denoised_audio = self.audio_compressor(audio, redundancy_audio)
+
+        fused = self.fusion_norm(
+            self.fusion(denoised_text, denoised_video, denoised_audio)
+        )
+        noise_intensity = self.nic(fused)
+        denoised = self.denoising_bottleneck(fused, noise_intensity)
+        classify = self.classifier
+
+        return {
+            "text_feats": text,
+            "video_feats": video,
+            "audio_feats": audio,
+            "denoised_text_feats": denoised_text,
+            "denoised_video_feats": denoised_video,
+            "denoised_audio_feats": denoised_audio,
+            "fused_feats": fused,
+            "denoised_feats": denoised,
+            "text_preds": classify(text),
+            "video_preds": classify(video),
+            "audio_preds": classify(audio),
+            "denoised_text_preds": classify(denoised_text),
+            "denoised_video_preds": classify(denoised_video),
+            "denoised_audio_preds": classify(denoised_audio),
+            "fused_preds": classify(fused),
+            DENOISED_KEY: classify(denoised),
+            "redundancy_t": redundancy_text.detach(),
+            "redundancy_v": redundancy_video.detach(),
+            "redundancy_a": redundancy_audio.detach(),
+            "noise_level": noise_intensity.detach(),
+        }
+
+def set_random_seed(seed=42):
+    print(f"Setting random seed: {seed}")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    print(f"Random seed set: {seed}")
+
+
 def collate_fn(batch):
-    text_feats = [item['text_feats'] for item in batch]
+    text_feats = [torch.as_tensor(item["text_feats"]) for item in batch]
+    ids = torch.stack([item[0] for item in text_feats])
+    mask = torch.stack([item[1] for item in text_feats])
     return {
-        'input_ids': torch.stack([t[0] for t in text_feats]),
-        'attention_mask': torch.stack([t[1] for t in text_feats]),
-        'video_feats': torch.stack([item['video_feats'] for item in batch]),
-        'audio_feats': torch.stack([item['audio_feats'] for item in batch]),
-        'label': torch.tensor([item['label_ids'] for item in batch])
+        "input_ids": ids,
+        "attention_mask": mask,
+        "video_feats": torch.stack([item["video_feats"] for item in batch]),
+        "audio_feats": torch.stack([item["audio_feats"] for item in batch]),
+        "label": torch.tensor([item["label_ids"] for item in batch]),
     }
+
+
 def compute_accuracy(model, loader):
     model.eval()
     preds = []
     labels = []
     with torch.no_grad():
         for batch in loader:
-            inputs = {
-                'text_input_ids': batch['input_ids'].to(device),
-                'text_attention_mask': batch['attention_mask'].to(device),
-                'video_feats': batch['video_feats'].to(device),
-                'audio_feats': batch['audio_feats'].to(device)
-            }
-            
-            outputs = model(**inputs)
-            
-            logits = outputs['fused_preds']
-            
-            probs = torch.softmax(logits, dim=1)
-            pred = probs.argmax(dim=1).cpu().numpy()
-            label = batch['label'].cpu().numpy()
-            preds.extend(pred)
-            labels.extend(label)
-    preds = np.array(preds)
-    labels = np.array(labels)
-    
-    accuracy = accuracy_score(labels, preds)
-    precision_weighted = precision_score(labels, preds, average='weighted', zero_division=0)
-    recall_weighted = recall_score(labels, preds, average='weighted', zero_division=0)
-    f1_weighted = f1_score(labels, preds, average='weighted', zero_division=0)
+            logits = model(**to_device(batch))[DENOISED_KEY]
+            preds.extend(torch.softmax(logits, dim=1).argmax(dim=1).cpu().numpy())
+            labels.extend(batch["label"].cpu().numpy())
+
+    preds = np.asarray(preds)
+    labels = np.asarray(labels)
     return {
-        'accuracy': accuracy,
-        'precision_weighted': precision_weighted,
-        'recall_weighted': recall_weighted,
-        'f1_weighted': f1_weighted
+        "accuracy": accuracy_score(labels, preds),
+        "precision_weighted": precision_score(
+            labels, preds, average="weighted", zero_division=0
+        ),
+        "recall_weighted": recall_score(
+            labels, preds, average="weighted", zero_division=0
+        ),
+        "f1_weighted": f1_score(labels, preds, average="weighted", zero_division=0),
+        "f1_macro": f1_score(labels, preds, average="macro", zero_division=0),
     }
-from torch.utils.tensorboard import SummaryWriter
-def compute_parameter_importance_converged(model, data_loader, device, num_batches=3):
+
+
+@torch.enable_grad()
+def compute_parameter_importance_converged(
+    model, data_loader, device, num_batches=4
+):
     model.eval()
-    
-    bottlenecks = [
-        model.text_compressor,
-        model.video_compressor,
-        model.audio_compressor,
-        model.denoising_bottleneck
-    ]
-    
-    importance_accumulators = {}
-    for i, bottleneck in enumerate(bottlenecks):
-        importance_accumulators[i] = {
-            'enc_weight': torch.zeros(bottleneck.max_bottleneck, device=device),
-            'enc_bias': torch.zeros(bottleneck.max_bottleneck, device=device),
-            'dec_weight': torch.zeros(bottleneck.max_bottleneck, device=device)
-        }
-    
+    model.set_selection(False)
+    bottlenecks = model.bottlenecks()
+    accumulated = {
+        key: torch.zeros(bottleneck.d_max, device=device)
+        for key, bottleneck in bottlenecks.items()
+    }
     valid_batches = 0
-    
-    for batch_idx, batch in enumerate(data_loader):
-        if batch_idx >= num_batches:
-            break
-            
-        try:
-            inputs = {
-                'text_input_ids': batch['input_ids'].to(device),
-                'text_attention_mask': batch['attention_mask'].to(device),
-                'video_feats': batch['video_feats'].to(device),
-                'audio_feats': batch['audio_feats'].to(device)
-            }
-            labels = batch['label'].to(device)
-            
-            model.zero_grad()
-            outputs = model(**inputs)
-            loss, _ = compute_loss(outputs, labels, denoised=True, deredundant=True)
-            
-            loss.backward()
-            
-            for i, bottleneck in enumerate(bottlenecks):
-                if bottleneck.encoder.weight.grad is not None:
-                    enc_weight_importance = (bottleneck.encoder.weight.norm(p=2, dim=1)**2 * 
-                                             bottleneck.encoder.weight.grad.norm(p=2, dim=1)**2)
-                    importance_accumulators[i]['enc_weight'] += enc_weight_importance.detach()
-                    
-                    if bottleneck.encoder.bias is not None and bottleneck.encoder.bias.grad is not None:
-                        enc_bias_importance = (bottleneck.encoder.bias.norm(p=2)**2 * 
-                                               bottleneck.encoder.bias.grad.norm(p=2)**2)
-                        enc_bias_expanded = enc_bias_importance.repeat(bottleneck.max_bottleneck)
-                        importance_accumulators[i]['enc_bias'] += enc_bias_expanded.detach()
-                    
-                    dec_weight_importance = (bottleneck.decoder.weight.norm(p=2, dim=0)**2 *
-                                             bottleneck.decoder.weight.grad.norm(p=2, dim=0)**2)
-                    importance_accumulators[i]['dec_weight'] += dec_weight_importance.detach()
-            
-            valid_batches += 1
-            model.zero_grad()
-            
-        except Exception as e:
-            print(f"Warning: Error processing batch {batch_idx}: {e}")
-            continue
-    
+
+    for batch in islice(data_loader, int(num_batches)):
+        labels = batch["label"].to(device)
+        model.zero_grad(set_to_none=True)
+        outputs = model(**to_device(batch))
+        loss, _ = compute_loss(outputs, labels)
+        loss.backward()
+
+        for key, bottleneck in bottlenecks.items():
+            weight_grad = bottleneck.encoder.weight.grad
+            if weight_grad is None:
+                continue
+
+            importance = (
+                bottleneck.encoder.weight.detach().norm(dim=1) ** 2
+            ) * (weight_grad.detach().norm(dim=1) ** 2)
+
+            bias_grad = bottleneck.encoder.bias.grad
+            if bias_grad is not None:
+                importance = importance + (
+                    bottleneck.encoder.bias.detach() ** 2
+                ) * (bias_grad.detach() ** 2)
+
+            decoder_grad = bottleneck.decoder.weight.grad
+            if decoder_grad is not None:
+                importance = importance + (
+                    bottleneck.decoder.weight.detach().norm(dim=0) ** 2
+                ) * (decoder_grad.detach().norm(dim=0) ** 2)
+            accumulated[key] += torch.nan_to_num(importance)
+
+        valid_batches += 1
+        model.zero_grad(set_to_none=True)
+
     if valid_batches == 0:
-        print("Warning: No valid batches for importance computation")
         return 0
-    
-    computed_count = 0
-    for i, bottleneck in enumerate(bottlenecks):
-        if valid_batches > 0:
-            avg_enc_weight = importance_accumulators[i]['enc_weight'] / valid_batches
-            avg_enc_bias = importance_accumulators[i]['enc_bias'] / valid_batches
-            avg_dec_weight = importance_accumulators[i]['dec_weight'] / valid_batches
-            
-            combined_importance = avg_enc_weight + avg_enc_bias + avg_dec_weight
-            
-            if combined_importance.sum() > 0:
-                normalized_importance = combined_importance / combined_importance.sum()
-            else:
-                normalized_importance = torch.ones(bottleneck.max_bottleneck, 
-                                                   device=combined_importance.device) / bottleneck.max_bottleneck
-            
-            bottleneck._importance_weights = normalized_importance.detach()
-            bottleneck._parameter_ranking = torch.argsort(normalized_importance, descending=True)
-            
-            computed_count += 1
-    
-    model.zero_grad()
-    return computed_count
+
+    for key, bottleneck in bottlenecks.items():
+        score = accumulated[key] / valid_batches
+        if float(score.sum()) <= 0:
+            score = torch.ones_like(score)
+        bottleneck._parameter_ranking.copy_(
+            torch.argsort(score, descending=True)
+        )
+        bottleneck.rank_ready.fill_(1.0)
+    model.set_selection(True)
+    return len(bottlenecks)
+
+def run_train_epoch(model, loader, optimizer):
+    model.train()
+    total_loss = 0.0
+    correct = 0
+
+    for batch in loader:
+        labels = batch["label"].to(device)
+        optimizer.zero_grad()
+        outputs = model(**to_device(batch))
+        loss, _ = compute_loss(outputs, labels)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        total_loss += loss.item()
+        correct += (outputs[DENOISED_KEY].argmax(dim=1) == labels).sum().item()
+
+    return total_loss / len(loader), correct / len(loader.dataset)
+
 
 def train_and_validate(data_manager):
-    
-    current_seed = getattr(args, 'seed', 42)
-    print(f"=== Training Started ===")
-    print(f"Current random seed: {current_seed}")
-    print(f"Using full SeD-UD model (both denoising and redundancy removal)")
-    
-    writer = SummaryWriter(log_dir=f'runs/experiment_sed_ud')
-    
-    train_loader = DataLoader(data_manager.mm_data['train'], 
-                            batch_size=args.train_batch_size, 
-                            shuffle=True, 
-                            collate_fn=collate_fn)
-    val_loader = DataLoader(data_manager.mm_data['dev'], 
-                          batch_size=args.eval_batch_size, 
-                          collate_fn=collate_fn)
-    
-    model = MultiModalClassifier(num_classes=args.num_labels).to(device)
-    
-    experiment_config = {
-        'seed': current_seed
-    }
-   
-    optimizer = optim.AdamW(model.parameters(), 
-                          lr=1e-5, 
-                          weight_decay=0.2,  
-                          eps=1e-9)  
-    
+    print("=== Training Started ===")
+    print(f"Current random seed: {args.seed}")
+    print(f"Dataset: {args.dataset} | device: {device}")
+
+    os.makedirs(args.save_dir, exist_ok=True)
+    checkpoint_path = os.path.join(args.save_dir, "best_model.pth")
+    pretrain_path = os.path.join(args.save_dir, "pretrain_model.pth")
+    print(f"Checkpoints will be written to: {checkpoint_path}")
+
+    train_loader = make_loader(
+        data_manager.mm_data["train"], args.train_batch_size, shuffle=True
+    )
+    val_loader = make_loader(
+        data_manager.mm_data["dev"], args.eval_batch_size
+    )
+
+    model = MultiModalClassifier(args, num_classes=args.num_labels).to(device)
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        eps=1e-9,
+    )
+
     def lr_lambda(epoch):
-        if epoch < 5:  
+        if epoch < 5:
             return 0.01 + (1 - 0.01) * epoch / 5
-        else:  
-            progress = (epoch - 5) / (args.num_train_epochs - 5)
-            return 0.5 * (1 + math.cos(math.pi * progress))
+        progress = (epoch - 5) / (args.num_train_epochs - 5)
+        return 0.5 * (1 + math.cos(math.pi * progress))
+
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    pretrain_epochs = int(args.pretrain_epochs)
     best_val_acc = 0.0
-    early_stopping = EarlyStopping(patience=10, delta=0.005)
-    
+    early_stopping = EarlyStopping(patience=20, delta=0.001)
+    model.set_selection(False)
+    print(f"IDAB pretrain phase: {pretrain_epochs} epochs without parameter selection")
+
     for epoch in range(args.num_train_epochs):
-        model.train()
-        train_loss = 0.0
-        train_correct = 0
-        for batch in train_loader:
-            inputs = {
-                'text_input_ids': batch['input_ids'].to(device),
-                'text_attention_mask': batch['attention_mask'].to(device),
-                'video_feats': batch['video_feats'].to(device),
-                'audio_feats': batch['audio_feats'].to(device)
-            }
-            labels = batch['label'].to(device)
-            optimizer.zero_grad()
-            outputs = model(**inputs)
-            loss, _ = compute_loss(outputs, labels, denoised=True, deredundant=True)  
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()  
-            train_loss += loss.item()
-            
-            preds_key = 'fused_preds'  
-            
-            if preds_key not in outputs:
-                raise KeyError(f"Prediction key {preds_key} does not exist in model output")
-            train_correct += (outputs[preds_key].argmax(1) == labels).sum().item()
-        
-        train_acc = train_correct / len(train_loader.dataset)
-        
+        train_loss, train_acc = run_train_epoch(
+            model, train_loader, optimizer
+        )
         model.eval()
         val_metrics = compute_accuracy(model, val_loader)
-        
         scheduler.step()
-        
-        early_stopping(val_metrics['accuracy'])
-        if early_stopping.early_stop:
-            print("Early stopping triggered")
-            import os
-            os.makedirs('./model', exist_ok=True)
-            
-            computed = compute_parameter_importance_converged(model, train_loader, device)
-            if computed > 0:
-                print(f"Training completed: Computed parameter importance for {computed} bottlenecks")
-            
-            torch.save(model.state_dict(), './model/best_model.pth')
-            print(f"Final model saved with parameter importance weights")
-            break
-        
-        if val_metrics['accuracy'] > best_val_acc:
-            best_val_acc = val_metrics['accuracy']
-        print(f"Epoch {epoch+1} | "
-              f"Train Loss: {train_loss/len(train_loader):.4f} | "
-              f"Train Acc: {train_acc:.2%} | "
-              f"Val Acc: {val_metrics['accuracy']:.2%} | "
-              f"Val F1: {val_metrics['f1_weighted']:.4f}")
+
+        if epoch + 1 == pretrain_epochs:
+            print("Computing global IDAB parameter importance on held-out dev batches...")
+            ranked = compute_parameter_importance_converged(
+                model,
+                val_loader,
+                device,
+                num_batches=int(args.importance_batches),
+            )
+            model.eval()
+            print(f"Ranked {ranked} IDAB bottlenecks; dynamic selection enabled")
+            early_stopping = EarlyStopping(patience=20, delta=0.001)
+            best_val_acc = 0.0
+
+        selection_started = epoch + 1 > pretrain_epochs and all(
+            float(b.rank_ready.item()) > 0 for b in model.bottlenecks().values()
+        )
+        if selection_started:
+            early_stopping(val_metrics[args.select_metric])
+            if early_stopping.early_stop:
+                print("Early stopping triggered")
+                print(f"Best validation checkpoint remains at {checkpoint_path}")
+                break
+            if val_metrics[args.select_metric] > best_val_acc:
+                best_val_acc = val_metrics[args.select_metric]
+                torch.save(model.state_dict(), checkpoint_path)
+                print(
+                    f"  new best val {args.select_metric} {best_val_acc:.4f} "
+                    f"-> saved to {checkpoint_path}"
+                )
+        else:
+            torch.save(model.state_dict(), pretrain_path)
+
+        print(
+            f"Epoch {epoch + 1} | Train Loss: {train_loss:.4f} | "
+            f"Train Acc: {train_acc:.2%} | Val Acc: {val_metrics['accuracy']:.2%} | "
+            f"Val F1: {val_metrics['f1_weighted']:.4f} | "
+            f"Val F1m: {val_metrics['f1_macro']:.4f}"
+        )
+
+
 def test_model(data_manager):
-    
-    test_loader = DataLoader(data_manager.mm_data['test'], batch_size=args.test_batch_size, collate_fn=collate_fn)
-    
-    model = MultiModalClassifier(num_classes=args.num_labels).to(device)
-    
-    import os
-    model_path = './model/best_model.pth'
-    
+    test_loader = make_loader(
+        data_manager.mm_data["test"], args.test_batch_size
+    )
+    model = MultiModalClassifier(args, num_classes=args.num_labels).to(device)
+    model_path = os.path.join(args.save_dir, "best_model.pth")
     if not os.path.exists(model_path):
         print(f"Error: Model file {model_path} not found")
         return
-    
+
     model.load_state_dict(torch.load(model_path, weights_only=True), strict=False)
+    ready = model.enable_selection_if_ready()
+    print(f"Dynamic IDAB selection enabled from checkpoint: {ready}")
     model.eval()
-    
-    print(f"Model loaded from: {model_path} (with parameter importance weights)")
-    
-    print("\n=== Model Loading Check ===")
-    print(f"Model parameters loaded successfully, ready to test with trained model")
-    
+    print(f"Model loaded from: {model_path}")
+
     all_preds = []
     all_labels = []
-    all_probs = []
     with torch.no_grad():
         for batch in test_loader:
-            inputs = {
-                'text_input_ids': batch['input_ids'].to(device),
-                'text_attention_mask': batch['attention_mask'].to(device),
-                'video_feats': batch['video_feats'].to(device),
-                'audio_feats': batch['audio_feats'].to(device)
-            }
-            labels = batch['label'].cpu().numpy()
-            
-            outputs = model(**inputs)
-            
-            preds_key = 'fused_preds'
-            
-            if preds_key not in outputs:
-                raise KeyError(f"Prediction key {preds_key} does not exist in model output")
-            
-            probs = torch.softmax(outputs[preds_key], dim=1).cpu().numpy()
-            preds = np.argmax(probs, axis=1)
+            labels = batch["label"].cpu().numpy()
+            outputs = model(**to_device(batch))
+            preds = outputs[DENOISED_KEY].argmax(dim=1).cpu().numpy()
             all_preds.extend(preds)
             all_labels.extend(labels)
-            all_probs.extend(probs)
-    
-    label_list = benchmarks[args.dataset]['labels']
-    
+
+    label_list = benchmarks[args.dataset]["labels"]
     print("\n=== Test Results ===")
-    print(classification_report(all_labels, all_preds, target_names=label_list, digits=4))
-    
+    print(
+        classification_report(
+            all_labels,
+            all_preds,
+            labels=list(range(len(label_list))),
+            target_names=label_list,
+            digits=4,
+            zero_division=0,
+        )
+    )
+
     test_metrics = compute_accuracy(model, test_loader)
-    
-    print("\n=== Comprehensive Evaluation Metrics (using sklearn functions) ===")
+    print("\n=== Comprehensive Evaluation Metrics ===")
     print(f"Accuracy (ACC): {test_metrics['accuracy']:.4f}")
     print(f"Weighted Precision: {test_metrics['precision_weighted']:.4f}")
     print(f"Weighted Recall: {test_metrics['recall_weighted']:.4f}")
     print(f"Weighted F1 Score: {test_metrics['f1_weighted']:.4f}")
+
+
 def main():
-    seed = getattr(args, 'seed', 42)  
-    set_random_seed(seed)
-    
+    set_random_seed(args.seed)
     print("=== Dataset Configuration ===")
     print(f"Dataset: {args.dataset}")
     print(f"Data path: {args.data_path}")
+
+    data_dir = os.path.join(args.data_path, args.dataset)
+    if not os.path.isdir(data_dir):
+        raise SystemExit(f"Data folder not found: {data_dir}")
+
     data = DataManager(args)
-    print(f"Dataset loaded:\n"
-          f"Training set: {len(data.mm_data['train'])} samples\n"
-          f"Validation set: {len(data.mm_data['dev'])} samples\n"
-          f"Test set: {len(data.mm_data['test'])} samples")
-    
+    print(
+        f"Dataset loaded:\n"
+        f"Training set: {len(data.mm_data['train'])} samples\n"
+        f"Validation set: {len(data.mm_data['dev'])} samples\n"
+        f"Test set: {len(data.mm_data['test'])} samples"
+    )
+
+    if args.test_only:
+        test_model(data)
+        return
+
     train_and_validate(data)
-    
     test_model(data)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

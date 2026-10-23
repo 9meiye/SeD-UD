@@ -23,16 +23,26 @@ ENV/
 # Training outputs
 runs/
 logs/
+saved_models/
 *.tfevents
 *.event
 checkpoints/
+*.pth
+*.pt
+*.ckpt
 
 # Data
 *.csv
 *.pkl
 *.h5
+*.npz
+*.npy
 data/raw/
 !data/*.py
+
+# Local documents and exports
+*.pdf
+codex-session-*.md
 
 # Backup files
 *_backup.py

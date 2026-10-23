@@ -14,7 +14,7 @@ Multimodal intent recognition (MIR) is hindered by substantial redundancy and no
 
 ```
 SeD-UD/
-├── main.py                 # Main training and evaluation script
+├── main.py                 # Model, training, and evaluation
 ├── configs-MIntRec.py      # Configuration for MIntRec dataset
 ├── configs-MELD-DA.py      # Configuration for MELD-DA dataset
 ├── requirements.txt        # Dependencies
@@ -27,10 +27,9 @@ SeD-UD/
 │   └── utils.py            # Data utilities
 ├── losses/
 │   ├── __init__.py
-│   └── total_loss.py       # Total loss computation (classification + saliency)
+│   └── total_loss.py       # Loss functions
 └── utils/
     ├── __init__.py
-    ├── alignment.py        # Feature alignment
     └── Function.py         # Utility functions
 ```
 
@@ -46,15 +45,9 @@ SeD-UD/
 
 ```
 torch>=2.0.0
-torchvision>=0.15.0
-scikit-learn>=1.3.0
 numpy>=1.24.0
-pandas>=2.0.0
+scikit-learn>=1.3.0
 transformers>=4.35.0
-matplotlib>=3.7.0
-tensorboard>=2.14.0
-pillow>=10.0.0
-tqdm>=4.66.0
 ```
 
 ---
@@ -103,7 +96,8 @@ The project uses dataset-specific configuration files. Update parameters in the 
 ### Training and Evaluation
 
 ```bash
-python main.py
+SEDUD_DATASET=MIntRec python main.py
+SEDUD_DATASET=MELD-DA python main.py
 ```
 
 ---
